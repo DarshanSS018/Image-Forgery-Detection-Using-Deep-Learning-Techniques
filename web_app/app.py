@@ -7,6 +7,7 @@ Open: http://localhost:5000
 =============================================================
 """
 
+from huggingface_hub import hf_hub_download
 import os, sys, io, uuid, json, torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -152,6 +153,42 @@ def load_hybrid_v2():
     return m
 
 print('Loading models...')
+def download_models_from_huggingface():
+    os.makedirs(MODELS_DIR, exist_ok=True)
+
+    repo_id = "Phoenix0181/image-forgery-detection-models"
+
+    model_files = [
+        "resnet_baseline.pth",
+        "efficientnet_model.pth",
+        "hybrid_model.pth",
+        "hybrid_model_v2_exif.pth"
+    ]
+
+    token = os.getenv("HF_TOKEN")
+
+    for filename in model_files:
+        local_path = os.path.join(MODELS_DIR, filename)
+
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+            print(f"Model already exists: {filename}")
+            continue
+
+        print(f"Downloading {filename} from Hugging Face...")
+
+        hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="model",
+            token=token,
+            local_dir=MODELS_DIR
+        )
+
+        print(f"Downloaded: {filename}")
+
+
+download_models_from_huggingface()
+
 MODELS = {
     'resnet'      : load_resnet(),
     'efficientnet': load_model(EfficientNetModel, 'efficientnet_model.pth'),
