@@ -356,52 +356,64 @@ def predict(model_key, pil_img, generate_heatmap=False):
 
 def predict_with_exif(pil_img, img_path):
     """
-    Runs the EXIF-aware Hybrid V2 model, if it's loaded. Returns None if
-    hybrid_model_v2_exif.pth hasn't been dropped into saved_models/ yet,
-    so callers can gracefully skip this section.
+    Runs the EXIF-aware Hybrid V2 model as a temporary model. Other cached
+    models are released first and V2 is released immediately afterwards.
     """
+    global _HYBRID_V2_INSTANCE
+    # The Phase 1 results have already been collected; release their models
+    # before loading the additional EXIF-aware network.
+    _LOADED_MODELS.clear()
+    gc.collect()
     hybrid_v2 = get_hybrid_v2()
     if hybrid_v2 is None:
         return None
-    exif_vec = extract_exif_features(img_path)
-    exif_tensor = torch.from_numpy(exif_vec).unsqueeze(0).to(DEVICE)
-    tensor = TRANSFORM(pil_img).unsqueeze(0).to(DEVICE)
-    with torch.no_grad():
-        out = hybrid_v2(tensor, exif_tensor)
-        probs = torch.softmax(out, dim=1)[0]
-    fp = float(probs[1])
-    ap = 1.0 - fp
-    exif_summary = {
-        name: float(val) for name, val in zip(EXIF_FEATURE_NAMES, exif_vec)
-    }
-    return {
-        'predicted'   : 'FORGED' if fp > 0.5 else 'AUTHENTIC',
-        'forged_prob' : round(fp * 100, 1),
-        'confidence'  : round((fp if fp > 0.5 else ap) * 100, 1),
-        'has_exif'    : bool(exif_summary['has_exif']),
-        'flagged_editor_software': bool(exif_summary['software_is_editor']),
-        'exif_features': exif_summary,
-    }
+    try:
+        exif_vec = extract_exif_features(img_path)
+        exif_tensor = torch.from_numpy(exif_vec).unsqueeze(0).to(DEVICE)
+        tensor = TRANSFORM(pil_img).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            out = hybrid_v2(tensor, exif_tensor)
+            probs = torch.softmax(out, dim=1)[0]
+        fp = float(probs[1])
+        ap = 1.0 - fp
+        exif_summary = {
+            name: float(val) for name, val in zip(EXIF_FEATURE_NAMES, exif_vec)
+        }
+        return {
+            'predicted'   : 'FORGED' if fp > 0.5 else 'AUTHENTIC',
+            'forged_prob' : round(fp * 100, 1),
+            'confidence'  : round((fp if fp > 0.5 else ap) * 100, 1),
+            'has_exif'    : bool(exif_summary['has_exif']),
+            'flagged_editor_software': bool(exif_summary['software_is_editor']),
+            'exif_features': exif_summary,
+        }
+    finally:
+        _HYBRID_V2_INSTANCE = None
+        del hybrid_v2
+        gc.collect()
 
 def run_full_analysis(pil_img, img_path, img_url):
     """
-    The complete per-image pipeline: Hybrid model + Grad-CAM, 3-model
-    comparison, 4-platform compression test, EXIF branch. Shared by the
-    single-image /analyze route and the batch /batch_full route so both
-    produce byte-identical result shapes.
+    Full analysis shared by single-image and batch-full routes.
+    The response structure and all analysis stages remain unchanged.
     """
     main_result = predict('hybrid', pil_img, generate_heatmap=True)
     if main_result is None:
         return None
     main_result['img_url'] = img_url
+
     model_comparison = {}
-    for mkey, mname in {'resnet':'ResNet50','efficientnet':'EfficientNet-B4','hybrid':'Hybrid (Ours)'}.items():
+    for mkey, mname in {
+        'resnet': 'ResNet50',
+        'efficientnet': 'EfficientNet-B4',
+        'hybrid': 'Hybrid (Ours)',
+    }.items():
         r = predict(mkey, pil_img)
         if r:
             model_comparison[mname] = {
-                'predicted' : r['predicted'],
+                'predicted': r['predicted'],
                 'confidence': r['confidence'],
-                'trust'     : r['trust'],
+                'trust': r['trust'],
             }
     main_result['model_comparison'] = model_comparison
     main_result['platform_results'] = test_all_platforms(pil_img)
@@ -410,27 +422,42 @@ def run_full_analysis(pil_img, img_path, img_url):
     if exif_result:
         main_result['exif_analysis'] = exif_result
     else:
-        main_result['exif_analysis'] = {'available': False,
-            'note': 'EXIF-aware model not yet trained/deployed (Phase 2)'}
+        main_result['exif_analysis'] = {
+            'available': False,
+            'note': 'EXIF-aware model not yet trained/deployed (Phase 2)',
+        }
     gc.collect()
     return main_result
 
 def test_all_platforms(pil_img):
-    results = {}
-    model_labels = {'resnet':'ResNet50','efficientnet':'EfficientNet-B4','hybrid':'Hybrid (Ours)'}
-    for platform, compressor in COMPRESSORS.items():
-        comp_img = compressor(pil_img.copy())
-        pres = {}
-        for mkey, mname in model_labels.items():
-            if MODELS[mkey] is None: continue
+    """
+    Compress each platform image once, then run all four images through one
+    model at a time. This avoids repeatedly loading/evicting secondary models.
+    """
+    results = {platform: {} for platform in COMPRESSORS}
+    model_labels = {
+        'resnet': 'ResNet50',
+        'efficientnet': 'EfficientNet-B4',
+        'hybrid': 'Hybrid (Ours)',
+    }
+    compressed_images = {
+        platform: compressor(pil_img.copy())
+        for platform, compressor in COMPRESSORS.items()
+    }
+
+    # Model-first order: each secondary network is loaded once per request.
+    for mkey, mname in model_labels.items():
+        if MODELS[mkey] is None:
+            continue
+        for platform, comp_img in compressed_images.items():
             r = predict(mkey, comp_img)
             if r:
-                pres[mkey] = {
-                    'name'      : mname,
-                    'predicted' : r['predicted'],
+                results[platform][mkey] = {
+                    'name': mname,
+                    'predicted': r['predicted'],
                     'confidence': r['confidence'],
                 }
-        results[platform] = pres
+        gc.collect()
     return results
 
 @app.route('/')
