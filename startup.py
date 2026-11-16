@@ -31,4 +31,4 @@ if __name__ == '__main__':
     print('Image Forgery Detection — Web App')
     print(f'Open: http://localhost:{port}')
     print('='*50 + '\n')
-    app.run(debug=True, host='0.0.0.0', port=port)
+    app.run(debug=False, host='0.0.0.0', port=port)

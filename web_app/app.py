@@ -8,7 +8,8 @@ Open: http://localhost:5000
 """
 
 from huggingface_hub import hf_hub_download
-import os, sys, io, uuid, json, torch
+import os, sys, io, uuid, json, gc, torch
+torch.set_num_threads(1)
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
@@ -115,87 +116,129 @@ TRANSFORM = transforms.Compose([
     transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
 ])
 
-def load_resnet():
-    path = os.path.join(MODELS_DIR, 'resnet_baseline.pth')
-    if not os.path.exists(path): print('  WARNING: resnet not found'); return None
-    ck = torch.load(path, map_location=DEVICE)
-    state = ck.get('model_state', ck)
-    m = ResNetBaseline().to(DEVICE)
-    m.load_ckpt(state)
-    m.eval()
-    print('  Loaded resnet_baseline.pth')
-    return m
-
-def load_model(cls, fname):
-    path = os.path.join(MODELS_DIR, fname)
-    if not os.path.exists(path): print(f'  WARNING: {fname} not found'); return None
-    ck = torch.load(path, map_location=DEVICE)
-    state = ck.get('model_state', ck)
-    m = cls().to(DEVICE)
-    m.load_state_dict(state, strict=True)
-    m.eval()
-    print(f'  Loaded {fname}')
-    return m
-
-def load_hybrid_v2():
-    fname = 'hybrid_model_v2_exif.pth'
-    path = os.path.join(MODELS_DIR, fname)
-    if not os.path.exists(path):
-        print(f'  INFO: {fname} not found — EXIF-aware model not loaded '
-              f'(falling back to Phase 1 hybrid for all predictions)')
-        return None
-    ck = torch.load(path, map_location=DEVICE)
-    state = ck.get('model_state', ck)
-    m = HybridModelV2().to(DEVICE)
-    m.load_state_dict(state, strict=True)
-    m.eval()
-    print(f'  Loaded {fname}')
-    return m
-
-print('Loading models...')
-def download_models_from_huggingface():
+def download_model_if_missing(filename):
+    """Downloads model checkpoint from Hugging Face on-demand if missing locally."""
     os.makedirs(MODELS_DIR, exist_ok=True)
-
-    repo_id = "Phoenix0181/image-forgery-detection-models"
-
-    model_files = [
-        "resnet_baseline.pth",
-        "efficientnet_model.pth",
-        "hybrid_model.pth",
-        "hybrid_model_v2_exif.pth"
-    ]
+    local_path = os.path.join(MODELS_DIR, filename)
+    if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+        return local_path
 
     token = os.getenv("HF_TOKEN")
-
-    for filename in model_files:
-        local_path = os.path.join(MODELS_DIR, filename)
-
-        if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-            print(f"Model already exists: {filename}")
-            continue
-
-        print(f"Downloading {filename} from Hugging Face...")
-
-        hf_hub_download(
+    repo_id = "Phoenix0181/image-forgery-detection-models"
+    try:
+        print(f"Downloading {filename} from Hugging Face ({repo_id})...")
+        downloaded = hf_hub_download(
             repo_id=repo_id,
             filename=filename,
             repo_type="model",
             token=token,
             local_dir=MODELS_DIR
         )
-
         print(f"Downloaded: {filename}")
+        return downloaded
+    except Exception as e:
+        print(f"Warning: Could not download {filename} from Hugging Face: {e}")
+        return None
 
+def load_resnet():
+    download_model_if_missing('resnet_baseline.pth')
+    path = os.path.join(MODELS_DIR, 'resnet_baseline.pth')
+    if not os.path.exists(path): print('  WARNING: resnet not found'); return None
+    ck = torch.load(path, map_location=DEVICE, weights_only=False)
+    state = ck.get('model_state', ck)
+    del ck
+    gc.collect()
+    m = ResNetBaseline().to(DEVICE)
+    m.load_ckpt(state)
+    del state
+    gc.collect()
+    m.eval()
+    print('  Loaded resnet_baseline.pth')
+    return m
 
-download_models_from_huggingface()
+def load_model(cls, fname):
+    download_model_if_missing(fname)
+    path = os.path.join(MODELS_DIR, fname)
+    if not os.path.exists(path): print(f'  WARNING: {fname} not found'); return None
+    ck = torch.load(path, map_location=DEVICE, weights_only=False)
+    state = ck.get('model_state', ck)
+    del ck
+    gc.collect()
+    m = cls().to(DEVICE)
+    m.load_state_dict(state, strict=True)
+    del state
+    gc.collect()
+    m.eval()
+    print(f'  Loaded {fname}')
+    return m
 
-MODELS = {
-    'resnet'      : load_resnet(),
-    'efficientnet': load_model(EfficientNetModel, 'efficientnet_model.pth'),
-    'hybrid'      : load_model(HybridModel, 'hybrid_model.pth'),
-}
-HYBRID_V2 = load_hybrid_v2()   # None until you drop in hybrid_model_v2_exif.pth
-print('All models loaded!')
+def load_hybrid_v2():
+    fname = 'hybrid_model_v2_exif.pth'
+    download_model_if_missing(fname)
+    path = os.path.join(MODELS_DIR, fname)
+    if not os.path.exists(path):
+        print(f'  INFO: {fname} not found — EXIF-aware model not loaded '
+              f'(falling back to Phase 1 hybrid for all predictions)')
+        return None
+    ck = torch.load(path, map_location=DEVICE, weights_only=False)
+    state = ck.get('model_state', ck)
+    del ck
+    gc.collect()
+    m = HybridModelV2().to(DEVICE)
+    m.load_state_dict(state, strict=True)
+    del state
+    gc.collect()
+    m.eval()
+    print(f'  Loaded {fname}')
+    return m
+
+# Memory-optimized lazy loading: models load on first request to stay within 512MB RAM
+_LOADED_MODELS = {}
+
+def get_model(model_key):
+    global _LOADED_MODELS
+    if model_key in _LOADED_MODELS and _LOADED_MODELS[model_key] is not None:
+        return _LOADED_MODELS[model_key]
+
+    # In 512MB RAM free tier, evict any non-hybrid model before loading another secondary model
+    if len(_LOADED_MODELS) >= 2:
+        evict_keys = [k for k in _LOADED_MODELS if k != 'hybrid']
+        for k in evict_keys:
+            del _LOADED_MODELS[k]
+        gc.collect()
+
+    if model_key == 'resnet':
+        _LOADED_MODELS['resnet'] = load_resnet()
+    elif model_key == 'efficientnet':
+        _LOADED_MODELS['efficientnet'] = load_model(EfficientNetModel, 'efficientnet_model.pth')
+    elif model_key == 'hybrid':
+        _LOADED_MODELS['hybrid'] = load_model(HybridModel, 'hybrid_model.pth')
+
+    return _LOADED_MODELS.get(model_key)
+
+class LazyModelDict:
+    """Provides standard dict access while loading models lazily on first access."""
+    def get(self, key, default=None):
+        m = get_model(key)
+        return m if m is not None else default
+    def __getitem__(self, key):
+        return get_model(key)
+    def __contains__(self, key):
+        return key in ('resnet', 'efficientnet', 'hybrid')
+    def items(self):
+        for k in ['resnet', 'efficientnet', 'hybrid']:
+            yield k, get_model(k)
+
+MODELS = LazyModelDict()
+
+_HYBRID_V2_INSTANCE = None
+def get_hybrid_v2():
+    global _HYBRID_V2_INSTANCE
+    if _HYBRID_V2_INSTANCE is None:
+        _HYBRID_V2_INSTANCE = load_hybrid_v2()
+    return _HYBRID_V2_INSTANCE
+
+print('Lazy model loader configured (512MB RAM optimized)!')
 
 BATCHES = BatchStore()   # in-memory batch_id -> {image_id: {path, img_url, filename}}
 
@@ -235,10 +278,17 @@ COMPRESSORS = {
 class GradCAM:
     def __init__(self, model, target_layer):
         self.model = model; self.grads = None; self.acts = None
-        target_layer.register_forward_hook(
+        self.fh = target_layer.register_forward_hook(
             lambda m,i,o: setattr(self,'acts',o.detach()))
-        target_layer.register_full_backward_hook(
+        self.bh = target_layer.register_full_backward_hook(
             lambda m,gi,go: setattr(self,'grads',go[0].detach()))
+    def remove(self):
+        if hasattr(self, 'fh') and self.fh:
+            try: self.fh.remove()
+            except Exception: pass
+        if hasattr(self, 'bh') and self.bh:
+            try: self.bh.remove()
+            except Exception: pass
     def generate(self, tensor):
         self.model.eval()
         out = self.model(tensor)
@@ -285,6 +335,7 @@ def predict(model_key, pil_img, generate_heatmap=False):
         'heatmap_url': None,
     }
     if generate_heatmap and model_key == 'hybrid':
+        gcam = None
         try:
             target = model.spatial_features[-1]
             gcam   = GradCAM(model, target)
@@ -298,6 +349,9 @@ def predict(model_key, pil_img, generate_heatmap=False):
             result['heatmap_url'] = url_for('static', filename=f'results/{hm_name}')
         except Exception as e:
             print(f'GradCAM error: {e}')
+        finally:
+            if gcam:
+                gcam.remove()
     return result
 
 def predict_with_exif(pil_img, img_path):
@@ -306,13 +360,14 @@ def predict_with_exif(pil_img, img_path):
     hybrid_model_v2_exif.pth hasn't been dropped into saved_models/ yet,
     so callers can gracefully skip this section.
     """
-    if HYBRID_V2 is None:
+    hybrid_v2 = get_hybrid_v2()
+    if hybrid_v2 is None:
         return None
     exif_vec = extract_exif_features(img_path)
     exif_tensor = torch.from_numpy(exif_vec).unsqueeze(0).to(DEVICE)
     tensor = TRANSFORM(pil_img).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
-        out = HYBRID_V2(tensor, exif_tensor)
+        out = hybrid_v2(tensor, exif_tensor)
         probs = torch.softmax(out, dim=1)[0]
     fp = float(probs[1])
     ap = 1.0 - fp
@@ -357,6 +412,7 @@ def run_full_analysis(pil_img, img_path, img_url):
     else:
         main_result['exif_analysis'] = {'available': False,
             'note': 'EXIF-aware model not yet trained/deployed (Phase 2)'}
+    gc.collect()
     return main_result
 
 def test_all_platforms(pil_img):
@@ -481,6 +537,7 @@ def batch_analyze():
             'trust_color': r['trust_color'],
         })
 
+    gc.collect()
     return jsonify({
         'batch_id' : batch_id,
         'count'    : len(results),
@@ -504,7 +561,11 @@ def batch_full(batch_id, image_id):
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'ok', 'models_loaded': {k: (v is not None) for k, v in MODELS.items()}})
+    return jsonify({
+        'status': 'ok',
+        'models_available': ['resnet', 'efficientnet', 'hybrid', 'hybrid_v2'],
+        'models_loaded': list(_LOADED_MODELS.keys())
+    })
 
 if __name__ == '__main__':
     _port = int(os.environ.get('PORT', 5000))
